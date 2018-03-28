@@ -4,10 +4,32 @@
 #include <GL/GL.h>
 #include <assert.h>
 #include <math.h>
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 internal Application_State app;
 
 #include "renderer.cpp"
+
+static LibRaw lr;
+
+struct RawImage {
+	char* filename;
+	LibRaw* raw;
+	s32 width;
+	s32 height;
+	u32 texture_id;
+	bool loaded;
+
+	r32* demosaic_data;
+
+	hm::vec2 position;
+};
+
+static RawImage loaded_image;
+
+int process_image(RawImage* loaded_image, char *file);
+int save_as_png(RawImage* image, char* out_filename);
 
 LRESULT CALLBACK window_callback(HWND window, UINT msg, WPARAM wparam, LPARAM lparam) {
 	switch (msg)
@@ -20,27 +42,42 @@ LRESULT CALLBACK window_callback(HWND window, UINT msg, WPARAM wparam, LPARAM lp
 	case WM_COMMAND: {
 		switch (wparam) {
 		case F_COMMAND_OPEN: {
-			wchar_t buffer[1024] = { 0 };
+			char buffer[1024] = { 0 };
 
-			OPENFILENAME fn = { 0 };
-			fn.lStructSize = sizeof(OPENFILENAME);
+			OPENFILENAMEA fn = { 0 };
+			fn.lStructSize = sizeof(OPENFILENAMEA);
 			fn.lpstrFile = buffer;
 			fn.nMaxFile = sizeof(buffer);
 
-			GetOpenFileName(&fn);
-			wprintf(L"Tried to open file %s\n", buffer);
+			int r = GetOpenFileNameA(&fn);
+			if (r != 0) {
+				int err = process_image(&loaded_image, buffer);//"scene_raw.CR2");
+				if (err == 0) {
+					ModifyMenu(app.file_menu, F_COMMAND_SAVE, MF_STRING, F_COMMAND_SAVE, L"&Save\tCtrl+S");
+					ModifyMenu(app.file_menu, F_COMMAND_SAVEAS, MF_STRING, F_COMMAND_SAVEAS, L"Save &As...");
+					ModifyMenu(app.file_menu, F_COMMAND_CLOSE, MF_STRING, F_COMMAND_CLOSE, L"&Close\tCtrl+W");
+				}
+			}
 		}break;
 		case F_COMMAND_SAVE:
 		case F_COMMAND_SAVEAS: {
-			wchar_t buffer[1024] = { 0 };
+			char buffer[1024] = { 0 };
 
-			OPENFILENAME fn = { 0 };
-			fn.lStructSize = sizeof(OPENFILENAME);
+			OPENFILENAMEA fn = { 0 };
+			fn.lStructSize = sizeof(OPENFILENAMEA);
 			fn.lpstrFile = buffer;
 			fn.nMaxFile = sizeof(buffer);
 
-			GetSaveFileName(&fn);
-			wprintf(L"Tried to save file %s\n", buffer);
+			int r = GetSaveFileNameA(&fn);
+			if (r != 0) {
+				int err = save_as_png(&loaded_image, buffer);
+				if (err != 0) {
+					char error_buffer[512] = { 0 };
+					sprintf(error_buffer, "Could not save file %s\n", buffer);
+					fprintf(stderr, "Could not save file %s\n", buffer);
+					MessageBoxA(0, error_buffer, "Error", MB_ICONERROR);
+				}
+			}
 		}break;
 		case F_COMMAND_EXIT: {
 			app.running = false;
@@ -54,9 +91,9 @@ LRESULT CALLBACK window_callback(HWND window, UINT msg, WPARAM wparam, LPARAM lp
 		app.file_menu = CreateMenu();
 		AppendMenu(app.file_menu, MF_STRING, F_COMMAND_NEW, L"&New... \tCtrl+N");
 		AppendMenu(app.file_menu, MF_STRING, F_COMMAND_OPEN, L"&Open...\tCtrl+O");
-		AppendMenu(app.file_menu, MF_STRING, F_COMMAND_SAVE, L"&Save\tCtrl+S");
-		AppendMenu(app.file_menu, MF_STRING, F_COMMAND_SAVEAS, L"Save &As...");
-		AppendMenu(app.file_menu, MF_STRING, F_COMMAND_CLOSE, L"&Close\tCtrl+W");
+		AppendMenu(app.file_menu, MF_STRING | MF_GRAYED, F_COMMAND_SAVE, L"&Save\tCtrl+S");
+		AppendMenu(app.file_menu, MF_STRING | MF_GRAYED, F_COMMAND_SAVEAS, L"Save &As...");
+		AppendMenu(app.file_menu, MF_STRING | MF_GRAYED, F_COMMAND_CLOSE, L"&Close\tCtrl+W");
 		AppendMenu(app.file_menu, MF_MENUBREAK, 0, 0);
 		AppendMenu(app.file_menu, MF_STRING, F_COMMAND_EXIT, L"E&xit");
 
@@ -146,18 +183,29 @@ int get_index(int x, int y, int width, int height, int channel) {
 	return (y * 4 * width + x * 4 + channel);
 }
 
-static u32 tex_id;
-static s32 img_width;
-static s32 img_height;
+int save_as_png(RawImage* image, char* out_filename) {
+	char* png = (char*)calloc(4, image->width * image->height);
+	glGetTextureImage(image->texture_id, 0, GL_RGBA, GL_UNSIGNED_BYTE, image->width * image->height * 4, png);
+	GLenum glerror = glGetError();
+	if (glerror != 0)
+		return -1;
+	int err = stbi_write_png(out_filename, image->width, image->height, 4, png, image->width * 4);
+	free(png);
+	if (err != 0)
+		return 0;
+	else
+		return -1;
+}
 
-int demosaic(LibRaw& img) {
+int demosaic(RawImage* loaded_image) {
+	LibRaw& img = *loaded_image->raw;
+
 	int width = img.imgdata.sizes.iwidth;
 	int height = img.imgdata.sizes.iheight;
-	ushort top_margin = img.imgdata.sizes.top_margin;
-	ushort max = 4036;
-	void* data = calloc(4, width * height * sizeof(float));
 
+	void* data = calloc(4, width * height * sizeof(r32));
 	short* ptr = (short*)img.imgdata.image;
+
 	for (int i = 0; i < width * height; ++i) {
 		s32 x = i % width;
 		s32 y = i / width;
@@ -167,57 +215,57 @@ int demosaic(LibRaw& img) {
 		ushort sb = ptr[get_index(x, y, width, height, 2)];
 		ushort sa = ptr[get_index(x, y, width, height, 3)];
 
-		r32 r = (r32)sr / (r32)max;
-		r32 g = (r32)sg / (r32)max;
-		r32 b = (r32)sb / (r32)max;
-		r32 a = (r32)sa / (r32)max;
+		r32 r = (r32)sr;
+		r32 g = (r32)sg;
+		r32 b = (r32)sb;
+		r32 a = (r32)sa;
 
 		bool pair_line = (y % 2 == 0);
 		bool pair_column = (x % 2 == 0);
 
 		if (!pair_column && !pair_line) {
 			// 4 cantos
-			r32 r_tl = ptr[get_index(x - 1, y - 1, width, height, 0)] / (r32)max;
-			r32 r_tr = ptr[get_index(x + 1, y - 1, width, height, 0)] / (r32)max;
-			r32 r_bl = ptr[get_index(x - 1, y + 1, width, height, 0)] / (r32)max;
-			r32 r_br = ptr[get_index(x + 1, y + 1, width, height, 0)] / (r32)max;
+			r32 r_tl = ptr[get_index(x - 1, y - 1, width, height, 0)];
+			r32 r_tr = ptr[get_index(x + 1, y - 1, width, height, 0)];
+			r32 r_bl = ptr[get_index(x - 1, y + 1, width, height, 0)];
+			r32 r_br = ptr[get_index(x + 1, y + 1, width, height, 0)];
 			r = (((r_tl + r_tr) / 2.0f) + ((r_bl + r_br) / 2.0f)) / 2.0f;
 			
-			r32 g_l = (ptr[get_index(x - 1, y, width, height, 1)] + ptr[get_index(x - 1, y, width, height, 3)]) / (r32)max;
-			r32 g_r = (ptr[get_index(x + 1, y, width, height, 1)] + ptr[get_index(x + 1, y, width, height, 3)]) / (r32)max;
-			r32 g_t = (ptr[get_index(x, y - 1, width, height, 1)] + ptr[get_index(x, y - 1, width, height, 3)]) / (r32)max;
-			r32 g_b = (ptr[get_index(x, y + 1, width, height, 1)] + ptr[get_index(x, y + 1, width, height, 3)]) / (r32)max;
+			r32 g_l = (ptr[get_index(x - 1, y, width, height, 1)] + ptr[get_index(x - 1, y, width, height, 3)]);
+			r32 g_r = (ptr[get_index(x + 1, y, width, height, 1)] + ptr[get_index(x + 1, y, width, height, 3)]);
+			r32 g_t = (ptr[get_index(x, y - 1, width, height, 1)] + ptr[get_index(x, y - 1, width, height, 3)]);
+			r32 g_b = (ptr[get_index(x, y + 1, width, height, 1)] + ptr[get_index(x, y + 1, width, height, 3)]);
 			g = (((g_l + g_r) / 2.0f) + ((g_t + g_b) / 2.0f)) / 2.0f;
 		}
 		if (!pair_column && pair_line) {
-			r32 r_l  = ptr[get_index(x - 1, y, width, height, 0)] / (r32)max;
-			r32 r_r  = ptr[get_index(x + 1, y, width, height, 0)] / (r32)max;
+			r32 r_l  = ptr[get_index(x - 1, y, width, height, 0)];
+			r32 r_r  = ptr[get_index(x + 1, y, width, height, 0)];
 			r = (r_l + r_r) / 2.0f;
 
-			r32 b_t = ptr[get_index(x, y - 1, width, height, 2)] / (r32)max;
-			r32 b_b = ptr[get_index(x, y + 1, width, height, 2)] / (r32)max;
+			r32 b_t = ptr[get_index(x, y - 1, width, height, 2)];
+			r32 b_b = ptr[get_index(x, y + 1, width, height, 2)];
 			b = (b_t + b_b) / 2.0f;
 		}
 		if (pair_column && !pair_line) {
-			r32 r_t  = ptr[get_index(x, y - 1, width, height, 0)] / (r32)max;
-			r32 r_b  = ptr[get_index(x, y + 1, width, height, 0)] / (r32)max;
+			r32 r_t  = ptr[get_index(x, y - 1, width, height, 0)];
+			r32 r_b  = ptr[get_index(x, y + 1, width, height, 0)];
 			r = (r_t + r_b) / 2.0f;
 
-			r32 b_l = ptr[get_index(x - 1, y, width, height, 2)] / (r32)max;
-			r32 b_r = ptr[get_index(x + 1, y, width, height, 2)] / (r32)max;
+			r32 b_l = ptr[get_index(x - 1, y, width, height, 2)];
+			r32 b_r = ptr[get_index(x + 1, y, width, height, 2)];
 			b = (b_l + b_r) / 2.0f;
 		}
 		if (pair_column && pair_line) {
-			r32 g_l = (ptr[get_index(x - 1, y, width, height, 1)] + ptr[get_index(x - 1, y, width, height, 3)]) / (r32)max;
-			r32 g_r = (ptr[get_index(x + 1, y, width, height, 1)] + ptr[get_index(x + 1, y, width, height, 3)]) / (r32)max;
-			r32 g_t = (ptr[get_index(x, y - 1, width, height, 1)] + ptr[get_index(x, y - 1, width, height, 3)]) / (r32)max;
-			r32 g_b = (ptr[get_index(x, y + 1, width, height, 1)] + ptr[get_index(x, y + 1, width, height, 3)]) / (r32)max;
+			r32 g_l = (ptr[get_index(x - 1, y, width, height, 1)] + ptr[get_index(x - 1, y, width, height, 3)]);
+			r32 g_r = (ptr[get_index(x + 1, y, width, height, 1)] + ptr[get_index(x + 1, y, width, height, 3)]);
+			r32 g_t = (ptr[get_index(x, y - 1, width, height, 1)] + ptr[get_index(x, y - 1, width, height, 3)]);
+			r32 g_b = (ptr[get_index(x, y + 1, width, height, 1)] + ptr[get_index(x, y + 1, width, height, 3)]);
 			g = (((g_l + g_r) / 2.0f) + ((g_t + g_b) / 2.0f)) / 2.0f;
 
-			r32 b_tl = ptr[get_index(x - 1, y - 1, width, height, 2)] / (r32)max;
-			r32 b_tr = ptr[get_index(x + 1, y - 1, width, height, 2)] / (r32)max;
-			r32 b_bl = ptr[get_index(x - 1, y + 1, width, height, 2)] / (r32)max;
-			r32 b_br = ptr[get_index(x + 1, y + 1, width, height, 2)] / (r32)max;
+			r32 b_tl = ptr[get_index(x - 1, y - 1, width, height, 2)];
+			r32 b_tr = ptr[get_index(x + 1, y - 1, width, height, 2)];
+			r32 b_bl = ptr[get_index(x - 1, y + 1, width, height, 2)];
+			r32 b_br = ptr[get_index(x + 1, y + 1, width, height, 2)];
 			b = (((b_tl + b_tr) / 2.0f) + ((b_bl + b_br) / 2.0f)) / 2.0f;
 		}
 
@@ -228,9 +276,10 @@ int demosaic(LibRaw& img) {
 	}
 
 	// 1082 1662
-	r32 wr = 1.0f / ((r32*)data)[get_index(1082, 1662, width, height, 0)];
-	r32 wg = 1.0f / ((r32*)data)[get_index(1082, 1662, width, height, 1)];
-	r32 wb = 1.0f / ((r32*)data)[get_index(1082, 1662, width, height, 2)];
+	// Hardcoded pixel value in the paper
+	r32 wr = 1.0f / ((r32*)data)[get_index(1760, 2431, width, height, 0)];
+	r32 wg = 1.0f / ((r32*)data)[get_index(1760, 2431, width, height, 1)];
+	r32 wb = 1.0f / ((r32*)data)[get_index(1760, 2431, width, height, 2)];
 
 	r32 wb_max = 0.0f;
 
@@ -246,9 +295,9 @@ int demosaic(LibRaw& img) {
 		g *= wg;
 		b *= wb;
 
-		//r = powf(r, 1.0f / 2.2f);
-		//g = powf(g, 1.0f / 2.2f);
-		//b = powf(b, 1.0f / 2.2f);
+		r = powf(r, 1.0f / 2.2f);
+		g = powf(g, 1.0f / 2.2f);
+		b = powf(b, 1.0f / 2.2f);
 
 		if (r > wb_max) wb_max = r;
 		if (g > wb_max) wb_max = g;
@@ -276,40 +325,52 @@ int demosaic(LibRaw& img) {
 		assert(g / wb_max <= 1.0f);
 		assert(b / wb_max <= 1.0f);
 	}
-
-
-	char* png = (char*)calloc(4, width * height);
-	for (int i = 0; i < width * height * 4; i += 4) {
-		png[i + 0] = (char)(255.0f * ((r32*)data)[i + 0]);
-		png[i + 1] = (char)(255.0f * ((r32*)data)[i + 1]);
-		png[i + 2] = (char)(255.0f * ((r32*)data)[i + 2]);
-		png[i + 3] = (char)(255.0f * ((r32*)data)[i + 3]);
-		int x = 0;
-	}
-	tex_id = create_texture(width, height, png);
-	return tex_id;
+	loaded_image->demosaic_data = (r32*)data;
+	u32 id = create_texture(width, height, data);
+	return id;
 }
 
-int process_image(char *file)
+int process_image(RawImage* loaded_image, char *file)
 {
-	// Let us create an image processor
-	LibRaw iProcessor;
-
 	// Open the file and read the metadata
-	iProcessor.open_file(file);
-
+	int err = lr.open_file(file);
+	if (err != 0) {
+		char buffer[512] = {0};
+		sprintf(buffer, "Could not open file %s\n", file);
+		fprintf(stderr, "Could not open file %s\n", file);
+		MessageBoxA(0, buffer, "Error", MB_ICONERROR);
+		return -1;
+	}
+	
 	// Let us unpack the image
-	iProcessor.unpack();
-
+	err = lr.unpack();
+	if (err != 0) {
+		char buffer[512] = { 0 };
+		sprintf(buffer, "Could not unpack the data in the file %s\n", file);
+		fprintf(stderr, "Could not unpack the data in the file %s\n", file);
+		MessageBoxA(0, buffer, "Error", MB_ICONERROR);
+		return -1;
+	}
+	
 	// Convert from imgdata.rawdata to imgdata.image:
-	iProcessor.raw2image();
-
-	img_width = iProcessor.imgdata.sizes.width;
-	img_height = iProcessor.imgdata.sizes.height;
-	tex_id = demosaic(iProcessor);
-
-	// Finally, let us free the image processor for work with the next image
-	iProcessor.recycle();
+	err = lr.raw2image();
+	if (err != 0) {
+		char buffer[512] = { 0 };
+		sprintf(buffer, "Could not get raw data from file %s\n", file);
+		fprintf(stderr, "Could not get raw data from file %s\n", file);
+		MessageBoxA(0, buffer, "Error", MB_ICONERROR);
+		return -1;
+	}
+	
+	loaded_image->raw = &lr;
+	loaded_image->width = lr.imgdata.sizes.width;
+	loaded_image->height = lr.imgdata.sizes.height;
+	loaded_image->texture_id = demosaic(loaded_image);
+	loaded_image->loaded = true;
+	loaded_image->position = hm::vec2(0, 0);
+	
+	// Free data
+	lr.recycle();
 	return 0;
 }
 
@@ -349,12 +410,7 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_
 	}
 
 	init_immediate_quad_mode();
-	process_image("scene_raw.CR2");
-	//hm::vec2 pos(30.0f, -2580.0f);
-	hm::vec2 pos(0.0f, 0.0f);
-	bool keys[] = {
-		false, false, false, false
-	};
+	//process_image(&loaded_image, "scene_raw.CR2");
 
 	app.running = true;
 	MSG msg;
@@ -404,19 +460,13 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_
 							//ModifyMenu(app.file_menu, F_COMMAND_NEW, MF_STRING, 0, L"&Novo...\tCtrl+N");
 						}
 					}break;
-					case VK_UP:    keys[0] = true; break;
-					case VK_DOWN:  keys[1] = true; break;
-					case VK_LEFT:  keys[2] = true; break;
-					case VK_RIGHT: keys[3] = true; break;
+					case VK_UP:    loaded_image.position.y -= 30.0f; break;
+					case VK_DOWN:  loaded_image.position.y += 30.0f; break;
+					case VK_LEFT:  loaded_image.position.x += 30.0f; break;
+					case VK_RIGHT: loaded_image.position.x -= 30.0f; break;
 				}
 			}break;
 			case WM_KEYUP: {
-				switch (msg.wParam) {
-					case VK_UP:    keys[0] = false; break;
-					case VK_DOWN:  keys[1] = false; break;
-					case VK_LEFT:  keys[2] = false; break;
-					case VK_RIGHT: keys[3] = false; break;
-				}
 			} break;
 			default: {
 				TranslateMessage(&msg);
@@ -426,19 +476,13 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_
 
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-		if (keys[0])
-			pos.y -= 30.0f;
-		if (keys[1])
-			pos.y += 30.0f;
-		if (keys[2])
-			pos.x += 30.0f;
-		if (keys[3])
-			pos.x -= 30.0f;
-
-		immediate_quad(tex_id, 0, img_width / 2, img_height / 2, 0, hm::vec4(1, 1, 1, 1), pos, app.window_info.width, app.window_info.height);
+		if (loaded_image.loaded) {
+			immediate_quad(loaded_image.texture_id, 0, loaded_image.width / 2, loaded_image.height / 2, 0, hm::vec4(1, 1, 1, 1), loaded_image.position, app.window_info.width, app.window_info.height);
+		}
 
 		SwapBuffers(app.window_info.device_context);
 	}
 
+	FreeConsole();
 	ExitProcess(0);
 }
