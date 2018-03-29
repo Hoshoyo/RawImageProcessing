@@ -2,14 +2,15 @@
 #include "win32_platform.h"
 #include <stdio.h>
 #include <GL/GL.h>
+#define HOGL_IMPLEMENT
+#include "ho_gl.h"
+#include "homath.h"
 #include <assert.h>
 #include <math.h>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
 internal Application_State app;
-
-#include "renderer.cpp"
 
 static LibRaw lr;
 
@@ -30,6 +31,9 @@ static RawImage loaded_image;
 
 int process_image(RawImage* loaded_image, char *file);
 int save_as_png(RawImage* image, char* out_filename);
+
+#include "renderer.cpp"
+#include "raw.cpp"
 
 LRESULT CALLBACK window_callback(HWND window, UINT msg, WPARAM wparam, LPARAM lparam) {
 	switch (msg)
@@ -175,14 +179,6 @@ void exec(const char* cmd) {
 	_pclose(pipe);
 }
 
-int get_index(int x, int y, int width, int height, int channel) {
-	if (x < 0) x += 2;
-	if (x >= width) x -= 2;
-	if (y < 0) y += 2;
-	if (y >= height) y -= 2;
-	return (y * 4 * width + x * 4 + channel);
-}
-
 int save_as_png(RawImage* image, char* out_filename) {
 	char* png = (char*)calloc(4, image->width * image->height);
 	glGetTextureImage(image->texture_id, 0, GL_RGBA, GL_UNSIGNED_BYTE, image->width * image->height * 4, png);
@@ -195,139 +191,6 @@ int save_as_png(RawImage* image, char* out_filename) {
 		return 0;
 	else
 		return -1;
-}
-
-int demosaic(RawImage* loaded_image) {
-	LibRaw& img = *loaded_image->raw;
-
-	int width = img.imgdata.sizes.iwidth;
-	int height = img.imgdata.sizes.iheight;
-
-	void* data = calloc(4, width * height * sizeof(r32));
-	short* ptr = (short*)img.imgdata.image;
-
-	for (int i = 0; i < width * height; ++i) {
-		s32 x = i % width;
-		s32 y = i / width;
-
-		ushort sr = ptr[get_index(x, y, width, height, 0)];
-		ushort sg = ptr[get_index(x, y, width, height, 1)];
-		ushort sb = ptr[get_index(x, y, width, height, 2)];
-		ushort sa = ptr[get_index(x, y, width, height, 3)];
-
-		r32 r = (r32)sr;
-		r32 g = (r32)sg;
-		r32 b = (r32)sb;
-		r32 a = (r32)sa;
-
-		bool pair_line = (y % 2 == 0);
-		bool pair_column = (x % 2 == 0);
-
-		if (!pair_column && !pair_line) {
-			// 4 cantos
-			r32 r_tl = ptr[get_index(x - 1, y - 1, width, height, 0)];
-			r32 r_tr = ptr[get_index(x + 1, y - 1, width, height, 0)];
-			r32 r_bl = ptr[get_index(x - 1, y + 1, width, height, 0)];
-			r32 r_br = ptr[get_index(x + 1, y + 1, width, height, 0)];
-			r = (((r_tl + r_tr) / 2.0f) + ((r_bl + r_br) / 2.0f)) / 2.0f;
-			
-			r32 g_l = (ptr[get_index(x - 1, y, width, height, 1)] + ptr[get_index(x - 1, y, width, height, 3)]);
-			r32 g_r = (ptr[get_index(x + 1, y, width, height, 1)] + ptr[get_index(x + 1, y, width, height, 3)]);
-			r32 g_t = (ptr[get_index(x, y - 1, width, height, 1)] + ptr[get_index(x, y - 1, width, height, 3)]);
-			r32 g_b = (ptr[get_index(x, y + 1, width, height, 1)] + ptr[get_index(x, y + 1, width, height, 3)]);
-			g = (((g_l + g_r) / 2.0f) + ((g_t + g_b) / 2.0f)) / 2.0f;
-		}
-		if (!pair_column && pair_line) {
-			r32 r_l  = ptr[get_index(x - 1, y, width, height, 0)];
-			r32 r_r  = ptr[get_index(x + 1, y, width, height, 0)];
-			r = (r_l + r_r) / 2.0f;
-
-			r32 b_t = ptr[get_index(x, y - 1, width, height, 2)];
-			r32 b_b = ptr[get_index(x, y + 1, width, height, 2)];
-			b = (b_t + b_b) / 2.0f;
-		}
-		if (pair_column && !pair_line) {
-			r32 r_t  = ptr[get_index(x, y - 1, width, height, 0)];
-			r32 r_b  = ptr[get_index(x, y + 1, width, height, 0)];
-			r = (r_t + r_b) / 2.0f;
-
-			r32 b_l = ptr[get_index(x - 1, y, width, height, 2)];
-			r32 b_r = ptr[get_index(x + 1, y, width, height, 2)];
-			b = (b_l + b_r) / 2.0f;
-		}
-		if (pair_column && pair_line) {
-			r32 g_l = (ptr[get_index(x - 1, y, width, height, 1)] + ptr[get_index(x - 1, y, width, height, 3)]);
-			r32 g_r = (ptr[get_index(x + 1, y, width, height, 1)] + ptr[get_index(x + 1, y, width, height, 3)]);
-			r32 g_t = (ptr[get_index(x, y - 1, width, height, 1)] + ptr[get_index(x, y - 1, width, height, 3)]);
-			r32 g_b = (ptr[get_index(x, y + 1, width, height, 1)] + ptr[get_index(x, y + 1, width, height, 3)]);
-			g = (((g_l + g_r) / 2.0f) + ((g_t + g_b) / 2.0f)) / 2.0f;
-
-			r32 b_tl = ptr[get_index(x - 1, y - 1, width, height, 2)];
-			r32 b_tr = ptr[get_index(x + 1, y - 1, width, height, 2)];
-			r32 b_bl = ptr[get_index(x - 1, y + 1, width, height, 2)];
-			r32 b_br = ptr[get_index(x + 1, y + 1, width, height, 2)];
-			b = (((b_tl + b_tr) / 2.0f) + ((b_bl + b_br) / 2.0f)) / 2.0f;
-		}
-
-		((r32*)data)[i * 4 + 0] = r;
-		((r32*)data)[i * 4 + 1] = g + a;
-		((r32*)data)[i * 4 + 2] = b;
-		((r32*)data)[i * 4 + 3] = 1.0f;
-	}
-
-	// 1082 1662
-	// Hardcoded pixel value in the paper
-	r32 wr = 1.0f / ((r32*)data)[get_index(1760, 2431, width, height, 0)];
-	r32 wg = 1.0f / ((r32*)data)[get_index(1760, 2431, width, height, 1)];
-	r32 wb = 1.0f / ((r32*)data)[get_index(1760, 2431, width, height, 2)];
-
-	r32 wb_max = 0.0f;
-
-	for (int i = 0; i < width * height; ++i) {
-		s32 x = i % width;
-		s32 y = i / width;
-
-		r32 r = ((r32*)data)[get_index(x, y, width, height, 0)];
-		r32 g = ((r32*)data)[get_index(x, y, width, height, 1)];
-		r32 b = ((r32*)data)[get_index(x, y, width, height, 2)];
-
-		r *= wr;
-		g *= wg;
-		b *= wb;
-
-		r = powf(r, 1.0f / 2.2f);
-		g = powf(g, 1.0f / 2.2f);
-		b = powf(b, 1.0f / 2.2f);
-
-		if (r > wb_max) wb_max = r;
-		if (g > wb_max) wb_max = g;
-		if (b > wb_max) wb_max = b;
-
-		((r32*)data)[get_index(x, y, width, height, 0)] = r;
-		((r32*)data)[get_index(x, y, width, height, 1)] = g;
-		((r32*)data)[get_index(x, y, width, height, 2)] = b;
-	}
-
-	
-	for (int i = 0; i < width * height; ++i) {
-		s32 x = i % width;
-		s32 y = i / width;
-
-		r32 r = ((r32*)data)[get_index(x, y, width, height, 0)];
-		r32 g = ((r32*)data)[get_index(x, y, width, height, 1)];
-		r32 b = ((r32*)data)[get_index(x, y, width, height, 2)];
-
-		((r32*)data)[get_index(x, y, width, height, 0)] = r / wb_max;
-		((r32*)data)[get_index(x, y, width, height, 1)] = g / wb_max;
-		((r32*)data)[get_index(x, y, width, height, 2)] = b / wb_max;
-
-		assert(r / wb_max <= 1.0f);
-		assert(g / wb_max <= 1.0f);
-		assert(b / wb_max <= 1.0f);
-	}
-	loaded_image->demosaic_data = (r32*)data;
-	u32 id = create_texture(width, height, data);
-	return id;
 }
 
 int process_image(RawImage* loaded_image, char *file)
@@ -366,6 +229,7 @@ int process_image(RawImage* loaded_image, char *file)
 	loaded_image->width = lr.imgdata.sizes.width;
 	loaded_image->height = lr.imgdata.sizes.height;
 	loaded_image->texture_id = demosaic(loaded_image);
+	//loaded_image->texture_id = load_raw(loaded_image);
 	loaded_image->loaded = true;
 	loaded_image->position = hm::vec2(0, 0);
 	
@@ -402,7 +266,7 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_
 	HWND window = CreateWindowEx(
 		WS_EX_ACCEPTFILES | WS_EX_APPWINDOW | WS_EX_WINDOWEDGE,
 		window_class.lpszClassName, L"Fotos",
-		WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 1024, 768, 0, 0, instance, 0);
+		WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 1024, 720, 0, 0, instance, 0);
 
 	if (!window) {
 		MessageBox(0, L"Error creating window", L"Fatal error", MB_ICONERROR);
@@ -477,7 +341,7 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
 		if (loaded_image.loaded) {
-			immediate_quad(loaded_image.texture_id, 0, loaded_image.width / 2, loaded_image.height / 2, 0, hm::vec4(1, 1, 1, 1), loaded_image.position, app.window_info.width, app.window_info.height);
+			immediate_quad(loaded_image.texture_id, 0, loaded_image.width / 4, loaded_image.height / 4, 0, hm::vec4(1, 1, 1, 1), loaded_image.position, app.window_info.width, app.window_info.height);
 		}
 
 		SwapBuffers(app.window_info.device_context);

@@ -1,7 +1,4 @@
 #include <GL/GL.h>
-#define HOGL_IMPLEMENT
-#include "ho_gl.h"
-#include "homath.h"
 
 typedef struct {
 	s8* data;
