@@ -9,6 +9,8 @@
 #include <math.h>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 internal Application_State app;
 
@@ -26,14 +28,33 @@ struct RawImage {
 
 	hm::vec2 position;
 };
-
 static RawImage loaded_image;
 
+struct LDRImage {
+	char* filename;
+	u8* data;
+	s32 width;
+	s32 height;
+	s32 channels;
+	u32 texture_id;
+	bool loaded;
+	hm::vec2 position;
+	r32 zoom;
+	r32 exposure_time;
+};
+static LDRImage ldr_image[16];
+static s32 ldr_index;
+static s32 selected_ldr;
+static u32 hdr_texture_id;
+static bool display_hdr;
+
 int process_image(RawImage* loaded_image, char *file);
+int load_ldr_image(LDRImage* image, r32 exp_time, char* file);
 int save_as_png(RawImage* image, char* out_filename);
 
 #include "renderer.cpp"
 #include "raw.cpp"
+#include "ldr_to_hdr.cpp"
 
 LRESULT CALLBACK window_callback(HWND window, UINT msg, WPARAM wparam, LPARAM lparam) {
 	switch (msg)
@@ -55,7 +76,11 @@ LRESULT CALLBACK window_callback(HWND window, UINT msg, WPARAM wparam, LPARAM lp
 
 			int r = GetOpenFileNameA(&fn);
 			if (r != 0) {
+#if ASSIGNMENT_1
 				int err = process_image(&loaded_image, buffer);//"scene_raw.CR2");
+#else
+				int err = load_ldr_image(&ldr_image[ldr_index++], 1.0f, buffer);	// TODO(psv): read exposure time
+#endif
 				if (err == 0) {
 					ModifyMenu(app.file_menu, F_COMMAND_SAVE, MF_STRING, F_COMMAND_SAVE, L"&Save\tCtrl+S");
 					ModifyMenu(app.file_menu, F_COMMAND_SAVEAS, MF_STRING, F_COMMAND_SAVEAS, L"Save &As...");
@@ -238,6 +263,24 @@ int process_image(RawImage* loaded_image, char *file)
 	return 0;
 }
 
+int load_ldr_image(LDRImage* image, r32 exp_time, char* file) {
+	image->data = stbi_load(file, &image->width, &image->height, &image->channels, 4);
+	if (!image->data) {
+		char buffer[512] = { 0 };
+		sprintf(buffer, "Could not load file %s", file);
+		fprintf(stderr, "Could not load file %s\n", file);
+		MessageBoxA(0, buffer, "Error", MB_ICONERROR);
+		return -1;
+	}
+	image->filename = file;
+	image->texture_id = create_texture(image->width, image->height, image->data);
+	image->loaded = true;
+	image->position = hm::vec2(0, 0);
+	image->zoom = 1.0f;
+	image->exposure_time = exp_time;
+	return 0;
+}
+
 int CALLBACK WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_line, int cmd_show) {
 
 	AllocConsole();
@@ -274,7 +317,6 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_
 	}
 
 	init_immediate_quad_mode();
-	//process_image(&loaded_image, "scene_raw.CR2");
 
 	app.running = true;
 	MSG msg;
@@ -283,6 +325,18 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_
 			case WM_KEYDOWN: {
 				bool ctrl_was_pressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 				switch (msg.wParam) {
+					case '0':
+					case '1':
+					case '2':
+					case '3':
+					case '4':
+					case '5':
+					case '6':
+					case '7':
+					case '8':
+					case '9':{
+						selected_ldr = msg.wParam - '0';
+					} break;
 					case 'O': {
 						if (ctrl_was_pressed)
 							SendMessage(window, WM_COMMAND, F_COMMAND_OPEN, 0);
@@ -322,12 +376,29 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_
 					case 'L': {
 						if (ctrl_was_pressed) {
 							//ModifyMenu(app.file_menu, F_COMMAND_NEW, MF_STRING, 0, L"&Novo...\tCtrl+N");
+						} else {
+							if (!ldr_image[0].loaded) {
+								load_ldr_image(&ldr_image[ldr_index++], 1.0f/30.0f, "C:\\dev\\\CompPhotography\\\LDR_image_sequence\\office_1.jpg");
+								load_ldr_image(&ldr_image[ldr_index++], 1.0f/10.0f,"C:\\dev\\\CompPhotography\\\LDR_image_sequence\\office_2.jpg");
+								load_ldr_image(&ldr_image[ldr_index++], 1.0f/3.0f,"C:\\dev\\\CompPhotography\\\LDR_image_sequence\\office_3.jpg");
+								load_ldr_image(&ldr_image[ldr_index++], 1.0f/2.0f,"C:\\dev\\\CompPhotography\\\LDR_image_sequence\\office_4.jpg");
+								load_ldr_image(&ldr_image[ldr_index++], 1.3f,"C:\\dev\\\CompPhotography\\\LDR_image_sequence\\office_5.jpg");
+								load_ldr_image(&ldr_image[ldr_index++], 4.0f,"C:\\dev\\\CompPhotography\\\LDR_image_sequence\\office_6.jpg");
+							}
 						}
 					}break;
-					case VK_UP:    loaded_image.position.y -= 30.0f; break;
-					case VK_DOWN:  loaded_image.position.y += 30.0f; break;
-					case VK_LEFT:  loaded_image.position.x += 30.0f; break;
-					case VK_RIGHT: loaded_image.position.x -= 30.0f; break;
+					case VK_UP:    loaded_image.position.y -= 30.0f; ldr_image[selected_ldr].position.y += 30.0f; break;
+					case VK_DOWN:  loaded_image.position.y += 30.0f; ldr_image[selected_ldr].position.y -= 30.0f; break;
+					case VK_LEFT:  loaded_image.position.x += 30.0f; ldr_image[selected_ldr].position.x -= 30.0f; break;
+					case VK_RIGHT: loaded_image.position.x -= 30.0f; ldr_image[selected_ldr].position.x += 30.0f; break;
+					case VK_OEM_PLUS:  ldr_image[selected_ldr].zoom /= 1.3f; break;
+					case VK_OEM_MINUS: ldr_image[selected_ldr].zoom *= 1.3f; break;
+					case 'R': ldr_image[selected_ldr].zoom = 1.0f; ldr_image[selected_ldr].position = hm::vec2(0, 0);  break;
+					case 'T': hdr_texture_id = ldr_to_hdr(ldr_image, ldr_index); break;
+					case 'H': display_hdr = !display_hdr; break;
+					default: {
+						fprintf(stdout, "Key: %llu\n", msg.wParam);
+					}break;
 				}
 			}break;
 			case WM_KEYUP: {
@@ -342,6 +413,21 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_
 
 		if (loaded_image.loaded) {
 			immediate_quad(loaded_image.texture_id, 0, loaded_image.width / 4, loaded_image.height / 4, 0, hm::vec4(1, 1, 1, 1), loaded_image.position, app.window_info.width, app.window_info.height);
+		}
+
+		if (display_hdr) {
+			immediate_quad(hdr_texture_id, 0, ldr_image[0].width, ldr_image[0].height, 0, hm::vec4(1, 1, 1, 1), ldr_image[0].position, app.window_info.width, app.window_info.height);
+		} else {
+			if (ldr_image[selected_ldr].loaded) {
+				immediate_quad(ldr_image[selected_ldr].texture_id, 0,
+					ldr_image[selected_ldr].width / ldr_image[selected_ldr].zoom,
+					ldr_image[selected_ldr].height / ldr_image[selected_ldr].zoom,
+					0,
+					hm::vec4(1, 1, 1, 1), 
+					ldr_image[selected_ldr].position,
+					app.window_info.width, 
+					app.window_info.height);
+			}
 		}
 
 		SwapBuffers(app.window_info.device_context);
